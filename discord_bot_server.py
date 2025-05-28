@@ -1,25 +1,19 @@
-# 파일명: discord_bot_server.py
+# 파일명: discord_bot_server.py (개선된 버전)
 
 import discord
 from discord.ext import commands
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 import asyncio
 import logging
 import threading
 from datetime import datetime
-import os # os 모듈 임포트
 
 # login_crawler.py에서 필요한 함수들을 임포트
 from login_crawler import get_bus_schedule, close_webdriver
 
-# key.py 파일 대신 환경 변수에서 설정값 불러오기
-# Render.com 배포 시 이 환경 변수들을 설정해야 합니다.
-DISCORD_BOT_TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
-# DISCORD_CHANNEL_ID는 int로 변환해야 합니다.
-DISCORD_CHANNEL_ID = int(os.environ.get('DISCORD_CHANNEL_ID')) if os.environ.get('DISCORD_CHANNEL_ID') else None
+# key.py 파일에서 설정값 불러오기
+from key import DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID
 
-# 로깅 설정
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Discord 봇 설정
@@ -29,323 +23,478 @@ intents.guilds = True # 봇이 길드(서버) 정보를 캐시하도록 허용
 intents.members = True # 봇이 멤버 정보를 캐시하도록 허용 (선택 사항이지만 도움이 될 수 있음)
 
 bot = commands.Bot(command_prefix='!', intents=intents, help_command=None) # 내장 help 명령어 비활성화
-scheduler = BackgroundScheduler(timezone='Asia/Seoul')
+scheduler = BackgroundScheduler()
 
 # --- 전역 상태 관리 변수 ---
 current_bus_schedules = []        # 현재 크롤링된 버스 노선 정보
 last_update_time = None           # current_bus_schedules가 마지막으로 갱신된 시간
-monitored_bus_ids = set()         # 모니터링 중인 버스 ID (예: 'BUS123')
-data_lock = threading.Lock()      # 전역 변수 접근 시 스레드 안전을 위한 락
+monitored_bus_ids = set()         # 모니터링할 버스 번호들 (사용자 입력, 여러 개 가능)
+last_monitored_seats = {}         # 마지막으로 모니터링한 버스의 좌석 정보 {bus_id: current_seats}
 
-# --- 버스 모니터링 및 Discord 알림 함수 ---
-async def monitor_all_monitored_buses_job():
-    """모니터링 중인 버스 정보를 크롤링하고 Discord에 알리는 비동기 작업."""
-    logging.info("버스 모니터링 작업을 시작합니다.")
-    global current_bus_schedules, last_update_time
+# 스레드 동기화를 위한 락
+data_lock = threading.Lock() # 데이터 접근을 위한 락 (크롤링 결과 및 모니터링 목록)
+webdriver_lock = threading.Lock() # WebDriver 인스턴스 접근을 위한 락 (login_crawler.py와 공유)
 
+
+# --- 디스코드 메시지 전송 함수 ---
+async def send_discord_message(channel_id, text_content):
+    """
+    디스코드 채널에 메시지를 보냅니다.
+    """
     try:
-        # 1. 버스 스케줄 크롤링 및 갱신
-        # login_crawler.py의 get_bus_schedule 함수 호출
-        new_schedules = get_bus_schedule()
-        with data_lock:
-            current_bus_schedules = new_schedules
-            last_update_time = datetime.now()
-        logging.info(f"버스 스케줄을 성공적으로 갱신했습니다. 총 {len(current_bus_schedules)}개 노선.")
-
-        # 2. 모니터링 중인 버스 정보 Discord 채널에 전송
-        if monitored_bus_ids:
-            if DISCORD_CHANNEL_ID is None:
-                logging.error("DISCORD_CHANNEL_ID가 설정되지 않았습니다. 알림을 보낼 수 없습니다.")
+        # 봇이 준비되지 않았으면 대기
+        if not bot.is_ready():
+            logging.warning("봇이 아직 준비되지 않았습니다. 3초 대기 후 재시도...")
+            await asyncio.sleep(3)
+            if not bot.is_ready():
+                logging.error("봇이 준비되지 않아 메시지를 보낼 수 없습니다.")
                 return
 
-            channel = bot.get_channel(DISCORD_CHANNEL_ID)
-            if channel:
-                msg_header = "🚌 **버스 도착 정보 업데이트** 🚌\n"
-                messages_to_send = []
-                current_msg_part = msg_header
-
-                # 모니터링 중인 버스 ID들을 순회하며 정보 구성
-                # set을 list로 변환하여 순회 (락 내부에서 monitored_bus_ids 변경 방지)
-                for bus_id in sorted(list(monitored_bus_ids)):
-                    bus_info = next((b for b in current_bus_schedules if b['id'] == bus_id), None)
-                    
-                    line_part = ""
-                    if bus_info:
-                        try:
-                            bus_number = bus_info.get('bus_number', 'N/A')
-                            bus_type = bus_info.get('bus_type', 'N/A')
-                            vehicle = bus_info.get('bus_vehicle', 'N/A')
-                            remaining_seats = bus_info.get('remaining_seats', 'N/A')
-                            total_seats = bus_info.get('total_seats', 'N/A')
-                            arrival_time = bus_info.get('arrival_time', 'N/A')
-
-                            line_part = (f"- **{bus_number}** ({bus_type}, {vehicle}): "
-                                         f"{arrival_time} 도착 예정, 잔여 좌석: {remaining_seats}/{total_seats}\n")
-                        except KeyError as ke:
-                            logging.warning(f"버스 정보 {bus_id}에서 키 오류: {ke} - 정보: {bus_info}")
-                            line_part = f"- ID: {bus_id} (정보 불완전 또는 오류 발생)\n"
-                    else:
-                        line_part = f"- ID: {bus_id} (정보를 찾을 수 없음, `!load`로 갱신 필요)\n"
-
-                    # Discord 메시지 길이 제한(2000자) 고려하여 메시지 분할
-                    if len(current_msg_part) + len(line_part) > 1900: # 여유롭게 1900자로 설정
-                        messages_to_send.append(current_msg_part)
-                        current_msg_part = "" # 다음 메시지 파트 시작
-
-                    current_msg_part += line_part
-
-                if current_msg_part and current_msg_part != msg_header: # 내용이 있으면 마지막 메시지 파트 추가
-                    messages_to_send.append(current_msg_part)
-                elif current_msg_part == msg_header and not monitored_bus_ids:
-                    # 모니터링 중인 버스가 없으면 빈 메시지 전송 방지
-                    logging.info("모니터링 중인 버스 노선이 없어 Discord 알림을 보내지 않습니다.")
-                    return
-
-                # Discord 메시지 전송
-                for msg_part in messages_to_send:
-                    await channel.send(msg_part)
-                logging.info("버스 도착 정보 Discord 채널에 성공적으로 전송.")
-            else:
-                logging.error(f"지정된 채널 ID {DISCORD_CHANNEL_ID}를 찾을 수 없습니다. 봇이 올바른 서버에 추가되었는지 확인하세요.")
+        channel = bot.get_channel(channel_id)
+        if channel:
+            logging.info(f"디스코드 메시지 전송 시도 (채널: {channel.name}, 내용: {text_content[:50]}...)")
+            await channel.send(text_content)
+            logging.info("디스코드 메시지 전송 성공!")
         else:
-            logging.info("모니터링 중인 버스 노선이 없어 Discord 알림을 보내지 않습니다.")
-
+            # 채널을 직접 fetch 시도
+            try:
+                channel = await bot.fetch_channel(channel_id)
+                if channel:
+                    logging.info(f"fetch로 채널 찾음. 메시지 전송 시도 (채널: {channel.name})")
+                    await channel.send(text_content)
+                    logging.info("디스코드 메시지 전송 성공!")
+                else:
+                    logging.error(f"채널 ID ({channel_id})를 fetch할 수 없습니다.")
+            except Exception as fetch_error:
+                logging.error(f"채널 fetch 중 오류: {fetch_error}")
+                logging.error(f"지정된 채널 ID ({channel_id})를 찾을 수 없습니다. 봇이 해당 채널에 접근 권한이 있는지 확인하세요.")
     except Exception as e:
-        logging.error(f"버스 모니터링 중 오류 발생: {e}", exc_info=True)
-        # 오류 발생 시 WebDriver를 닫아서 다음 실행을 위해 깨끗한 상태 유지
-        close_webdriver()
-        
-        if DISCORD_CHANNEL_ID is not None:
-            channel = bot.get_channel(DISCORD_CHANNEL_ID)
-            if channel:
-                await channel.send(f"⚠️ **오류 발생**: 버스 정보를 가져오는 중 문제가 발생했습니다. 관리자에게 문의하세요.")
-        else:
-             logging.error("DISCORD_CHANNEL_ID가 설정되지 않아 오류 알림을 Discord로 보낼 수 없습니다.")
+        logging.error(f"메시지 전송 중 오류 발생: {e}", exc_info=True)
 
-# --- Discord 봇 이벤트 핸들러 ---
+
+# --- 버스 스케줄 초기 로드 및 갱신 함수 (단 한 번의 크롤링으로 모든 데이터 가져옴) ---
+def update_bus_schedules():
+    global current_bus_schedules, last_update_time
+    logging.info("버스 스케줄 데이터 갱신 시작...")
+    with webdriver_lock: # WebDriver 접근 시 락 사용
+        try:
+            new_schedules = get_bus_schedule() # login_crawler에서 모든 버스 정보 가져옴
+            with data_lock: # 데이터 갱신 시 락 사용
+                current_bus_schedules = new_schedules
+                last_update_time = datetime.now()
+            logging.info(f"버스 스케줄 데이터 갱신 완료. ({len(current_bus_schedules)}개 노선)")
+            return True # 성공
+        except Exception as e:
+            logging.error(f"버스 스케줄 데이터 갱신 중 오류 발생: {e}", exc_info=True)
+            # 오류 발생 시 WebDriver 닫기
+            try:
+                close_webdriver()
+            except Exception as ce:
+                logging.error(f"WebDriver 닫기 중 오류 발생: {ce}")
+            return False # 실패
+
+
+# --- 모니터링 중인 모든 버스 좌석 모니터링 함수 (주기적으로 실행될 메인 잡) ---
+def monitor_all_monitored_buses_job():
+    """
+    스케줄러에 의해 주기적으로 실행될 모니터링 작업 함수.
+    모니터링 대상인 모든 버스에 대해 좌석 현황을 확인하고 알림을 보냅니다.
+    """
+    global last_monitored_seats, current_bus_schedules, monitored_bus_ids
+
+    # 1. 최신 버스 스케줄 데이터 갱신 (단 한 번의 크롤링)
+    logging.info("모니터링을 위해 전체 버스 스케줄 데이터 갱신 시작...")
+    if not update_bus_schedules():
+        message = "버스 스케줄 갱신 중 오류가 발생하여 현재 모니터링을 정상적으로 수행할 수 없습니다."
+        future = asyncio.run_coroutine_threadsafe(
+            send_discord_message(DISCORD_CHANNEL_ID, message), 
+            bot.loop
+        )
+        try:
+            future.result(timeout=10)
+        except Exception as send_error:
+            logging.error(f"메시지 전송 실패: {send_error}")
+        logging.error("전체 버스 스케줄 갱신 실패. 모니터링 작업 중단.")
+        
+        # 오류 시 모든 모니터링 중단 및 WebDriver 닫기
+        with data_lock:
+            monitored_bus_ids.clear()
+            last_monitored_seats.clear()
+        with webdriver_lock:
+            close_webdriver()
+        
+        # 이 잡 자체를 제거하여 더 이상 실행되지 않도록 함
+        if scheduler.get_job('main_bus_monitor_job'):
+            scheduler.remove_job('main_bus_monitor_job')
+            logging.info("메인 모니터링 잡 'main_bus_monitor_job' 제거 완료.")
+        return
+
+    # 2. 모니터링 대상 버스들에 대한 알림 로직 처리
+    with data_lock: # current_bus_schedules 및 monitored_bus_ids, last_monitored_seats 접근 시 락 사용
+        buses_to_remove = set() # 모니터링을 중단할 버스 ID 목록
+        for bus_id_to_monitor in list(monitored_bus_ids): # Set을 iterate하면서 remove하면 오류 발생 가능 -> list로 변환 후 사용
+            monitored_bus_info = next((bus for bus in current_bus_schedules if bus['id'] == bus_id_to_monitor), None)
+
+            if monitored_bus_info:
+                current_seats = monitored_bus_info['current_seats']
+                total_seats = monitored_bus_info['total_seats']
+                prev_seats = last_monitored_seats.get(bus_id_to_monitor)
+
+                # 첫 실행 알림 (만석 상태 확인)
+                if prev_seats is None:
+                    if current_seats == total_seats:
+                        initial_message = f"✅ ID '{bus_id_to_monitor}'번 노선이 현재 만석({current_seats}/{total_seats})입니다!\n" \
+                                          f"노선: {monitored_bus_info['bus_route_detail']}"
+                        future = asyncio.run_coroutine_threadsafe(
+                            send_discord_message(DISCORD_CHANNEL_ID, initial_message), 
+                            bot.loop
+                        )
+                        try:
+                            future.result(timeout=10)
+                            logging.info(f"ID '{bus_id_to_monitor}' 첫 모니터링 알림 전송 (만석): {current_seats}/{total_seats}")
+                        except Exception as send_error:
+                            logging.error(f"첫 모니터링 알림 전송 실패: {send_error}")
+                        # 만석이면 계속 모니터링
+                        last_monitored_seats[bus_id_to_monitor] = current_seats
+                    else:
+                        initial_message = f"ID '{bus_id_to_monitor}'번 노선은 현재 만석이 아닙니다. " \
+                                          f"현재 좌석: {current_seats}/{total_seats}\n" \
+                                          f"만석({total_seats}/{total_seats})이 되면 알림을 보내드릴게요."
+                        future = asyncio.run_coroutine_threadsafe(
+                            send_discord_message(DISCORD_CHANNEL_ID, initial_message), 
+                            bot.loop
+                        )
+                        try:
+                            future.result(timeout=10)
+                            logging.info(f"ID '{bus_id_to_monitor}' 첫 모니터링 알림 전송 (만석 아님): {current_seats}/{total_seats}")
+                        except Exception as send_error:
+                            logging.error(f"첫 모니터링 알림 전송 실패: {send_error}")
+                        buses_to_remove.add(bus_id_to_monitor) # 만석이 아니므로 모니터링 중단 요청
+                
+                # 만석 (total_seats/total_seats)일 때 알림 로직
+                elif current_seats == total_seats:
+                    if prev_seats is not None and prev_seats != total_seats: # 만석 상태가 새로 감지되었을 때
+                        message = f"✅ ID '{bus_id_to_monitor}'번 노선이 만석({current_seats}/{total_seats})이 되었습니다!\n" \
+                                  f"노선: {monitored_bus_info['bus_route_detail']}\n" \
+                                  f"예약 페이지: <https://kit.kumoh.ac.kr/jsp/administration/bus/bus_reservation.jsp>"
+                        future = asyncio.run_coroutine_threadsafe(
+                            send_discord_message(DISCORD_CHANNEL_ID, message), 
+                            bot.loop
+                        )
+                        try:
+                            future.result(timeout=10)
+                            logging.info(f"ID '{bus_id_to_monitor}' 만석 알림 전송: {current_seats}/{total_seats}")
+                        except Exception as send_error:
+                            logging.error(f"만석 알림 전송 실패: {send_error}")
+                    else:
+                        logging.info(f"ID '{bus_id_to_monitor}' 계속 만석 유지 중: {current_seats}/{total_seats}")
+                    last_monitored_seats[bus_id_to_monitor] = current_seats # 현재 좌석 상태 저장
+                else: # 만석이 아닐 때 (prev_seats == total_seats 였을 경우)
+                    if prev_seats == total_seats: 
+                        message = f"🚌 ID '{bus_id_to_monitor}'번 노선이 만석이 아니게 되었습니다. " \
+                                  f"현재 좌석: {current_seats}/{total_seats}\n" \
+                                  f"노선: {monitored_bus_info['bus_route_detail']}"
+                        future = asyncio.run_coroutine_threadsafe(
+                            send_discord_message(DISCORD_CHANNEL_ID, message), 
+                            bot.loop
+                        )
+                        try:
+                            future.result(timeout=10)
+                            logging.info(f"ID '{bus_id_to_monitor}' 만석 아님으로 변경 알림 전송: {current_seats}/{total_seats}")
+                        except Exception as send_error:
+                            logging.error(f"만석 아님 알림 전송 실패: {send_error}")
+                    else:
+                        logging.info(f"ID '{bus_id_to_monitor}' 계속 만석 아님 유지 중: {current_seats}/{total_seats}. 추가 알림 없음.")
+                    buses_to_remove.add(bus_id_to_monitor) # 만석이 아니므로 모니터링 중단 요청
+            else:
+                # 버스 정보를 찾을 수 없는 경우
+                message = f"ID '{bus_id_to_monitor}' 노선을 찾을 수 없습니다. 모니터링을 중단합니다."
+                future = asyncio.run_coroutine_threadsafe(
+                    send_discord_message(DISCORD_CHANNEL_ID, message), 
+                    bot.loop
+                )
+                try:
+                    future.result(timeout=10)
+                except Exception as send_error:
+                    logging.error(f"노선 없음 알림 전송 실패: {send_error}")
+                logging.warning(f"ID '{bus_id_to_monitor}' 노선을 찾을 수 없음. 모니터링 중단.")
+                buses_to_remove.add(bus_id_to_monitor) # 해당 버스 ID 제거 요청
+        
+        # 모니터링 중단 요청된 버스들을 실제로 제거
+        for bus_id in buses_to_remove:
+            monitored_bus_ids.discard(bus_id)
+            if bus_id in last_monitored_seats:
+                del last_monitored_seats[bus_id]
+            logging.info(f"ID '{bus_id}' 모니터링 중단 처리 완료.")
+
+    # 3. 모든 모니터링이 중단되면 WebDriver 닫기
+    if not monitored_bus_ids:
+        logging.info("모니터링 중인 버스가 없어 WebDriver를 닫습니다.")
+        with webdriver_lock:
+            close_webdriver()
+        # 모든 모니터링이 끝나면 메인 잡도 제거
+        if scheduler.get_job('main_bus_monitor_job'):
+            scheduler.remove_job('main_bus_monitor_job')
+            logging.info("메인 모니터링 잡 'main_bus_monitor_job' 제거 완료 (모든 버스 중단).")
+
+
+# --- 정기 업데이트 함수 (모니터링 중인 버스가 없을 때만 전체 스케줄 갱신) ---
+def scheduled_hourly_update():
+    global monitored_bus_ids
+    with data_lock: # monitored_bus_ids 접근 시 락 사용
+        if not monitored_bus_ids: # 모니터링 중인 버스가 없을 때만 실행
+            logging.info("모니터링 중인 버스가 없어 1시간 주기 전체 버스 스케줄 갱신을 실행합니다.")
+            
+            if not update_bus_schedules():
+                logging.error("1시간 주기 버스 스케줄 갱신 실패.")
+            else:
+                future = asyncio.run_coroutine_threadsafe(
+                    send_discord_message(DISCORD_CHANNEL_ID, "⏰ 정기 업데이트: 버스 노선 정보가 갱신되었습니다. `!list`로 확인하세요."),
+                    bot.loop
+                )
+                try:
+                    future.result(timeout=10)
+                except Exception as send_error:
+                    logging.error(f"정기 업데이트 알림 전송 실패: {send_error}")
+        else:
+            logging.info("모니터링 중인 버스가 있어 1시간 주기 전체 버스 스케줄 갱신을 건너뜁니다 (메인 모니터링 잡이 이미 갱신).")
+
+
+# --- 디스코드 봇 이벤트 핸들러 ---
 @bot.event
 async def on_ready():
-    """봇이 Discord에 로그인되었을 때 실행됩니다."""
-    logging.info(f'Logged in as {bot.user.name} ({bot.user.id})')
-    print(f'Logged in as {bot.user.name} ({bot.user.id})')
+    logging.info(f'Logged in as {bot.user} (ID: {bot.user.id})')
+    logging.info(f'설정된 채널 ID: {DISCORD_CHANNEL_ID}')
+    
+    # 채널 접근 가능 여부 확인
+    try:
+        channel = bot.get_channel(DISCORD_CHANNEL_ID)
+        if channel:
+            logging.info(f'채널 접근 성공: {channel.name} (ID: {channel.id})')
+            await channel.send("🤖 금오공대 통학버스 알리미가 시작되었습니다! `!load` 명령어로 시작하세요.")
+        else:
+            # fetch로 재시도
+            try:
+                channel = await bot.fetch_channel(DISCORD_CHANNEL_ID)
+                logging.info(f'채널 fetch 성공: {channel.name} (ID: {channel.id})')
+                await channel.send("🤖 금오공대 통학버스 알리미가 시작되었습니다! `!load` 명령어로 시작하세요.")
+            except Exception as fetch_error:
+                logging.error(f'채널 접근 실패 (ID: {DISCORD_CHANNEL_ID}): {fetch_error}')
+                logging.error('key.py 파일의 DISCORD_CHANNEL_ID가 올바른지 확인하세요.')
+    except Exception as e:
+        logging.error(f'채널 접근 중 오류: {e}')
 
-    # APScheduler 시작
+    logging.info(f'봇이 연결되었습니다! 디스코드에서 `!help` 명령어를 사용해보세요.')
+    
     if not scheduler.running:
         scheduler.start()
-        logging.info("Scheduler started.")
+        logging.info("APScheduler 시작됨.")
+        # 1시간 주기 전체 버스 스케줄 갱신 작업 추가 (모니터링 중인 버스가 없을 때만 동작)
+        scheduler.add_job(scheduled_hourly_update, 'interval', hours=1, id='hourly_full_update')
+        logging.info("1시간 주기 전체 버스 스케줄 갱신 작업이 추가되었습니다.")
 
-    # 봇 시작 시 APScheduler에 메인 버스 모니터링 잡을 추가합니다.
-    # 기존 job이 없으면 추가, 있으면 무시 (replace_existing=False가 기본값)
-    if not scheduler.get_job('main_bus_monitor_job'):
-        # CronTrigger를 사용하여 평일(월-금), 오전 9시부터 다음 날 새벽 2시까지 (즉, 새벽 3시 ~ 오전 8시 중단)
-        # 매 1분마다 실행되도록 스케줄 설정
-        scheduler.add_job(monitor_all_monitored_buses_job, 'cron',
-                          day_of_week='mon-fri', # 월요일(0)부터 금요일(4)까지
-                          hour='9-2',            # 오전 9시(9)부터 다음 날 새벽 2시(2)까지
-                          minute='*/1',          # 매 1분마다
-                          id='main_bus_monitor_job')
-        logging.info("Main bus monitor job scheduled for weekdays (9 AM - 2 AM KST).")
-    else:
-        logging.info("Main bus monitor job already exists and is running.")
+
+# --- 디스코드 봇 명령어 ---
+@bot.command(name='load', help='버스 조회 프로그램을 실행하고 초기 노선 정보를 로드합니다. (최초 1회 실행 권장)')
+async def load_buses(ctx):
+    await ctx.send("버스 조회 프로그램을 실행합니다. 잠시 기다려주세요...")
+
+    def run_initial_crawl_thread_discord():
+        logging.info("초기 크롤링 스레드 시작...")
+        if update_bus_schedules(): # 여기서 한 번만 전체 크롤링
+            asyncio.run_coroutine_threadsafe(
+                ctx.send(f"로그인 및 초기 버스 노선 조회에 성공했습니다. ({len(current_bus_schedules)}개 노선 로드)\n`!list`를 입력하여 노선 리스트를 확인하세요."),
+                bot.loop
+            )
+        else:
+            asyncio.run_coroutine_threadsafe(
+                ctx.send("로그인 및 초기 버스 노선 조회에 실패했거나, 노선 정보가 없습니다."),
+                bot.loop
+            )
+        logging.info("초기 크롤링 스레드 완료.")
+
+    threading.Thread(target=run_initial_crawl_thread_discord, daemon=True).start()
+
+
+@bot.command(name='list', help='현재 로드된 버스 노선 리스트를 표시합니다.')
+async def list_buses(ctx):
+    # 가장 최신 데이터를 보여주기 위해 !list 명령 시에도 한 번 갱신 시도
+    await ctx.send("버스 노선 정보를 갱신 중입니다. 잠시만 기다려주세요...")
+    update_success = False
+    def run_update_in_thread():
+        nonlocal update_success
+        update_success = update_bus_schedules() # 여기서 한 번만 전체 크롤링
     
-    # 봇이 시작될 때 미리 한 번 버스 정보를 로드합니다.
-    # 이는 사용자가 !monitor 명령어를 사용하기 전에 버스 정보가 없어서
-    # "정보를 찾을 수 없음" 메시지가 뜨는 것을 방지하기 위함입니다.
-    try:
-        logging.info("Initial bus data load on bot start...")
-        temp_schedules = get_bus_schedule()
-        with data_lock:
-            global current_bus_schedules, last_update_time
-            current_bus_schedules = temp_schedules
-            last_update_time = datetime.now()
-        logging.info(f"Initial bus data load complete. Loaded {len(current_bus_schedules)} schedules.")
-    except Exception as e:
-        logging.error(f"Initial bus data load failed: {e}", exc_info=True)
-        close_webdriver() # 실패 시 웹드라이버 닫기
+    thread = threading.Thread(target=run_update_in_thread, daemon=True)
+    thread.start()
+    thread.join(timeout=30) # 갱신이 완료될 때까지 최대 30초 대기
 
-
-@bot.event
-async def on_command_error(ctx, error):
-    """명령어 실행 중 오류 발생 시 처리."""
-    if isinstance(error, commands.CommandNotFound):
-        await ctx.send(f"알 수 없는 명령어입니다. `!help`를 입력하여 사용 가능한 명령어를 확인하세요.")
-    elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"명령어 인수가 부족합니다. 올바른 사용법: `{ctx.command.signature}`")
-    else:
-        logging.error(f"명령어 실행 중 오류 발생: {error}", exc_info=True)
-        await ctx.send(f"명령어 실행 중 오류가 발생했습니다: `{error}`")
-
-# --- Discord 봇 명령어 ---
-@bot.command(name='help', help='사용 가능한 명령어 목록을 보여줍니다.')
-async def show_help(ctx):
-    help_text = """
-    **🚌 버스 알리미 봇 명령어 🚌**
-    
-    `!help` - 이 도움말 메시지를 보여줍니다.
-    `!load` - 금오공대 셔틀버스 정보를 수동으로 새로고침합니다. (새로운 버스 노선 확인용)
-    `!list` - 현재 로드된 모든 버스 노선 정보를 보여줍니다.
-    `!monitor [버스ID]` - 해당 버스 ID를 모니터링 목록에 추가합니다. (예: `!monitor K1`)
-    `!unmonitor [버스ID]` - 해당 버스 ID를 모니터링 목록에서 제거합니다. (예: `!unmonitor K1`)
-    `!monitors` - 현재 모니터링 중인 버스 목록을 보여줍니다.
-    `!status` - 봇의 현재 상태와 설정 정보를 확인합니다.
-    
-    **💡 참고:**
-    - 버스 정보 업데이트는 **평일(월~금) 오전 9시부터 다음 날 새벽 2시까지** 매 1분마다 자동으로 진행됩니다.
-    - `버스ID`는 `!list` 명령어로 확인할 수 있는 `ID` 값을 사용합니다. (예: K1, K2, K3, N1, N2, N3 등)
-    """
-    await ctx.send(help_text)
-
-@bot.command(name='load', help='버스 정보를 수동으로 새로고침합니다.')
-async def load_bus_info(ctx):
-    """금오공대 셔틀버스 정보를 수동으로 새로고침하고 Discord에 알립니다."""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        await ctx.send(f"이 명령어는 <#{DISCORD_CHANNEL_ID}> 채널에서만 사용 가능합니다.")
-        return
-
-    await ctx.send("🚌 버스 정보를 새로고침 중입니다... 잠시만 기다려주세요.")
-    try:
-        new_schedules = get_bus_schedule()
-        with data_lock:
-            global current_bus_schedules, last_update_time
-            current_bus_schedules = new_schedules
-            last_update_time = datetime.now()
-        await ctx.send(f"✅ 버스 정보를 성공적으로 새로고침했습니다. 총 {len(current_bus_schedules)}개 노선.")
-        logging.info(f"수동으로 버스 정보를 새로고침했습니다. 총 {len(current_bus_schedules)}개 노선.")
-    except Exception as e:
-        logging.error(f"버스 정보 새로고침 중 오류 발생: {e}", exc_info=True)
-        close_webdriver() # 실패 시 웹드라이버 닫기
-        await ctx.send(f"❌ 버스 정보를 새로고침하는 데 실패했습니다. 오류: {e}")
-
-@bot.command(name='list', help='현재 로드된 모든 버스 노선 정보를 보여줍니다.')
-async def list_all_buses(ctx):
-    """현재 로드된 모든 버스 노선 정보를 Discord에 전송합니다."""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        await ctx.send(f"이 명령어는 <#{DISCORD_CHANNEL_ID}> 채널에서만 사용 가능합니다.")
-        return
-
-    with data_lock:
+    if not update_success:
+        await ctx.send("버스 노선 정보 갱신에 실패했거나 시간이 초과되었습니다. 현재 캐시된 정보를 표시합니다.")
         if not current_bus_schedules:
-            await ctx.send("현재 로드된 버스 노선 정보가 없습니다. `!load` 명령어로 새로고침해주세요.")
+            await ctx.send("현재 로드된 버스 노선 정보가 없습니다. `!load`를 입력하여 먼저 프로그램을 실행해주세요.")
             return
 
-        msg_header = "🚌 **현재 로드된 버스 노선 목록** 🚌\n"
-        messages_to_send = []
-        current_msg_part = msg_header
+    with data_lock: # current_bus_schedules 접근 시 락 사용
+        if current_bus_schedules:
+            header = "🚌 현재 버스 노선 리스트:\n"
+            if last_update_time:
+                header += f"최종 갱신: {last_update_time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            else:
+                header += "\n"
 
-        for bus_info in current_bus_schedules:
-            try:
-                bus_id = bus_info.get('id', 'N/A')
-                bus_number = bus_info.get('bus_number', 'N/A')
-                bus_type = bus_info.get('bus_type', 'N/A')
-                vehicle = bus_info.get('bus_vehicle', 'N/A')
-                arrival_time = bus_info.get('arrival_time', 'N/A')
-                remaining_seats = bus_info.get('remaining_seats', 'N/A')
-                total_seats = bus_info.get('total_seats', 'N/A')
+            bus_list_parts = []
+            current_part = header
 
-                line_part = (f"ID: `{bus_id}` | 노선: **{bus_number}** ({bus_type}, {vehicle})\n"
-                             f"  > 도착 예정: {arrival_time}, 잔여 좌석: {remaining_seats}/{total_seats}\n")
-                
-                if len(current_msg_part) + len(line_part) > 1900:
-                    messages_to_send.append(current_msg_part)
-                    current_msg_part = ""
-                current_msg_part += line_part
+            for bus in current_bus_schedules:
+                bus_info = (
+                    f"[{bus['id']}] {bus['bus_type']} - {bus['bus_number']} ({bus['bus_vehicle']})\n"
+                    f"  지역: {bus['bus_region']}\n"
+                    f"  노선: {bus['bus_route_detail']}\n"
+                    f"  좌석: {bus['current_seats']}/{bus['total_seats']}\n"
+                    f"--------------------\n"
+                )
 
-            except KeyError as ke:
-                logging.warning(f"버스 정보 리스팅 중 키 오류: {ke} - 정보: {bus_info}")
-                line_part = f"ID: `{bus_info.get('id', 'N/A')}` (정보 불완전 또는 오류 발생)\n"
-                if len(current_msg_part) + len(line_part) > 1900:
-                    messages_to_send.append(current_msg_part)
-                    current_msg_part = ""
-                current_msg_part += line_part
+                if len(current_part) + len(bus_info) > 1990:
+                    bus_list_parts.append(current_part)
+                    current_part = "🚌 버스 노선 리스트 (계속):\n"
+                    if last_update_time:
+                        current_part += f"최종 갱신: {last_update_time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    else:
+                        current_part += "\n"
 
-        if current_msg_part:
-            messages_to_send.append(current_msg_part)
-        
-        for msg_part in messages_to_send:
-            await ctx.send(msg_part)
+                current_part += bus_info
 
-@bot.command(name='monitor', help='버스 ID를 모니터링 목록에 추가합니다. `!monitor [버스ID]`')
-async def add_monitor(ctx, bus_id: str):
-    """모니터링 목록에 버스 ID를 추가합니다."""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        await ctx.send(f"이 명령어는 <#{DISCORD_CHANNEL_ID}> 채널에서만 사용 가능합니다.")
+            if current_part.strip() != header.strip():
+                bus_list_parts.append(current_part)
+            elif not bus_list_parts and current_bus_schedules:
+                bus_list_parts.append(current_part)
+
+            for part in bus_list_parts:
+                await ctx.send(part)
+                await asyncio.sleep(0.5)
+
+        else:
+            await ctx.send("현재 로드된 버스 노선 정보가 없습니다. `!load`를 입력하여 먼저 프로그램을 실행해주세요.")
+
+
+@bot.command(name='monitor', help='만석 알림을 받을 버스 번호(ID)를 설정합니다. 여러 버스를 모니터링할 수 있습니다. 예: `!monitor 5` 또는 `!monitor 5 12`')
+async def monitor_bus(ctx, *bus_ids: str): # 여러 인자를 받을 수 있도록 변경
+    global monitored_bus_ids
+
+    if not bus_ids:
+        await ctx.send("모니터링할 버스 ID를 입력해주세요. 예: `!monitor 5` 또는 `!monitor 5 12`")
         return
 
-    bus_id = bus_id.upper() # 대소문자 구분 없이 처리
-
-    with data_lock:
-        if bus_id in monitored_bus_ids:
-            await ctx.send(f"버스 ID `{bus_id}`는 이미 모니터링 중입니다.")
-            return
-
-        monitored_bus_ids.add(bus_id)
-        # 현재 로드된 스케줄에서 버스 정보 확인 (사용자 편의를 위해 버스 이름 표시)
-        bus_info = next((b for b in current_bus_schedules if b['id'] == bus_id), None)
-        bus_name_display = f"{bus_info['bus_number']} ({bus_info['bus_type']})" if bus_info else bus_id
-
-        await ctx.send(f"버스 ID `{bus_name_display}`를 모니터링 목록에 추가했습니다. "
-                       f"자동 업데이트는 평일 오전 9시부터 다음 날 새벽 2시까지 매 1분마다 진행됩니다.")
-
-@bot.command(name='unmonitor', help='모니터링 목록에서 버스 ID를 제거합니다. `!unmonitor [버스ID]`')
-async def remove_monitor(ctx, bus_id: str):
-    """모니터링 목록에서 버스 ID를 제거합니다."""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        await ctx.send(f"이 명령어는 <#{DISCORD_CHANNEL_ID}> 채널에서만 사용 가능합니다.")
+    if not current_bus_schedules:
+        await ctx.send("버스 노선 정보가 로드되지 않았습니다. 먼저 `!load` 명령어를 실행해주세요.")
         return
 
-    bus_id = bus_id.upper() # 대소문자 구분 없이 처리
+    added_count = 0
+    not_found_ids = []
 
-    with data_lock:
-        if bus_id not in monitored_bus_ids:
-            await ctx.send(f"버스 ID `{bus_id}`는 모니터링 중이 아닙니다.")
-            return
+    with data_lock: # monitored_bus_ids 접근 시 락 사용
+        for bus_id in bus_ids:
+            found_bus = next((bus for bus in current_bus_schedules if bus['id'] == bus_id), None)
 
-        monitored_bus_ids.remove(bus_id)
-        await ctx.send(f"버스 ID `{bus_id}`를 모니터링 목록에서 제거했습니다.")
+            if found_bus:
+                if bus_id not in monitored_bus_ids:
+                    monitored_bus_ids.add(bus_id)
+                    added_count += 1
+                    # 첫 알림을 위해 last_monitored_seats 초기화
+                    last_monitored_seats[bus_id] = None # 초기 상태를 None으로 설정하여 첫 크롤링 시 알림 트리거
+                    await ctx.send(f"ID '{bus_id}'번 노선 만석 알림 모니터링 목록에 추가했습니다. 첫 좌석 현황을 확인 중...")
+                else:
+                    await ctx.send(f"ID '{bus_id}'번 노선은 이미 모니터링 중입니다.")
+            else:
+                not_found_ids.append(bus_id)
+    
+    if not_found_ids:
+        await ctx.send(f"입력하신 ID {', '.join(not_found_ids)}는 존재하지 않습니다. `!list`를 입력하여 노선 리스트를 확인해주세요.")
+    
+    if added_count > 0:
+        await ctx.send(f"총 {added_count}개의 버스 노선 모니터링을 시작했습니다.")
+        # 메인 모니터링 잡이 없으면 추가
+        if not scheduler.get_job('main_bus_monitor_job'):
+            scheduler.add_job(monitor_all_monitored_buses_job, 'interval', minutes=1, id='main_bus_monitor_job')
+            logging.info("메인 모니터링 잡 'main_bus_monitor_job' 시작됨.")
+            # 잡이 추가된 직후 바로 한 번 실행하여 초기 상태 확인
+            def run_initial_monitor_thread():
+                logging.info("메인 모니터링 잡 초기 실행 스레드 시작...")
+                monitor_all_monitored_buses_job()
+                logging.info("메인 모니터링 잡 초기 실행 스레드 완료.")
+            threading.Thread(target=run_initial_monitor_thread, daemon=True).start()
 
-@bot.command(name='monitors', help='현재 모니터링 중인 버스 목록을 보여줍니다.')
-async def list_monitors(ctx):
-    """현재 모니터링 중인 버스 목록을 Discord에 전송합니다."""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        await ctx.send(f"이 명령어는 <#{DISCORD_CHANNEL_ID}> 채널에서만 사용 가능합니다.")
+
+@bot.command(name='stop', help='버스 노선 모니터링을 중지합니다. 예: `!stop 5` (5번 버스 중지), `!stop all` (모든 버스 중지)')
+async def stop_monitoring(ctx, bus_id_or_all: str = None):
+    global monitored_bus_ids, last_monitored_seats
+
+    if bus_id_or_all is None:
+        await ctx.send("어떤 버스 모니터링을 중지할지 지정해주세요. 예: `!stop 5` (5번 버스 중지), `!stop all` (모든 버스 중지)")
         return
 
-    with data_lock:
+    stopped_count = 0
+    with data_lock: # monitored_bus_ids, last_monitored_seats 접근 시 락 사용
+        if bus_id_or_all.lower() == 'all':
+            current_monitored = list(monitored_bus_ids) # Set을 iterate하면서 remove하면 오류 발생 가능 -> list로 변환 후 사용
+            for bus_id in current_monitored:
+                monitored_bus_ids.discard(bus_id)
+                if bus_id in last_monitored_seats:
+                    del last_monitored_seats[bus_id]
+                stopped_count += 1
+            
+            if stopped_count > 0:
+                await ctx.send(f"모든 ({stopped_count}개) 버스 노선 모니터링을 중지했습니다.")
+            else:
+                await ctx.send("현재 모니터링 중인 버스 노선이 없습니다.")
+        else:
+            bus_id = bus_id_or_all
+            if bus_id in monitored_bus_ids:
+                monitored_bus_ids.discard(bus_id)
+                if bus_id in last_monitored_seats:
+                    del last_monitored_seats[bus_id]
+                stopped_count += 1
+                await ctx.send(f"ID '{bus_id}'번 버스 노선 모니터링을 중지했습니다.")
+            else:
+                await ctx.send(f"ID '{bus_id}'번 버스 노선은 현재 모니터링 중이 아닙니다.")
+    
+    # 모든 모니터링이 중단되면 WebDriver도 닫고 메인 모니터링 잡도 중단
+    if not monitored_bus_ids:
+        logging.info("모든 모니터링이 중단되어 WebDriver를 닫고 메인 모니터링 잡을 중단합니다.")
+        with webdriver_lock:
+            close_webdriver()
+        if scheduler.get_job('main_bus_monitor_job'):
+            scheduler.remove_job('main_bus_monitor_job')
+            logging.info("메인 모니터링 잡 'main_bus_monitor_job' 제거 완료.")
+
+
+@bot.command(name='monitoring_list', help='현재 모니터링 중인 버스 노선 리스트를 표시합니다.')
+async def monitoring_list(ctx):
+    with data_lock: # monitored_bus_ids, current_bus_schedules 접근 시 락 사용
         if monitored_bus_ids:
-            # 버스 ID를 오름차순으로 정렬하여 표시
-            sorted_monitors = sorted(list(monitored_bus_ids))
-            msg = "👀 **현재 모니터링 중인 버스 목록** 👀\n"
+            msg = "👀 **현재 모니터링 중인 버스 노선 ID:**\n"
             
-            messages_to_send = []
-            current_msg_part = msg
+            # 최신 버스 노선 정보로 current_bus_schedules를 갱신 (선택 사항이지만 최신 정보를 보여주는 것이 좋음)
+            # 이 부분은 monitor_all_monitored_buses_job이 주기적으로 갱신하므로, 
+            # 여기서는 캐시된 current_bus_schedules를 사용해도 무방
+            # 만약 정말 즉각적인 최신 정보가 필요하면 여기서도 update_bus_schedules()를 호출할 수 있음.
+            # 하지만 잦은 호출은 부하가 될 수 있으므로, 현재 캐시된 정보 사용을 우선 고려.
+            # (현재 코드는 !list처럼 별도 스레드에서 업데이트를 시도하는 방식)
 
-            for bus_id in sorted_monitors:
-                bus_info = next((b for b in current_bus_schedules if b['id'] == bus_id), None)
-                bus_name_display = f"{bus_info['bus_number']} ({bus_info['bus_type']})" if bus_info else bus_id
-                
-                line_part = f"- `{bus_id}` ({bus_name_display})\n"
-
-                if len(current_msg_part) + len(line_part) > 1900:
-                    messages_to_send.append(current_msg_part)
-                    current_msg_part = ""
-                current_msg_part += line_part
-
-            if current_msg_part:
-                messages_to_send.append(current_msg_part)
-            
-            for msg_part in messages_to_send:
-                await ctx.send(msg_part)
+            for bus_id in sorted(list(monitored_bus_ids)):
+                bus_info = next((bus for bus in current_bus_schedules if bus['id'] == bus_id), None)
+                if bus_info:
+                    msg += f"- ID: {bus_id}, 노선: {bus_info['bus_route_detail']}, 현재 좌석: {bus_info['current_seats']}/{bus_info['total_seats']}\n"
+                else:
+                    msg += f"- ID: {bus_id} (정보를 찾을 수 없음, `!load`로 갱신 필요)\n" 
+            await ctx.send(msg)
         else:
             await ctx.send("현재 모니터링 중인 버스 노선이 없습니다. `!monitor [버스ID]` 명령어로 모니터링을 시작하세요.")
 
 
 @bot.command(name='status', help='현재 봇 상태와 채널 정보를 확인합니다.')
 async def bot_status(ctx):
-    """봇의 현재 상태 정보를 Discord에 전송합니다."""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        await ctx.send(f"이 명령어는 <#{DISCORD_CHANNEL_ID}> 채널에서만 사용 가능합니다.")
-        return
-
     with data_lock: # 전역 변수 접근 시 락 사용
         status_msg = f"🤖 **봇 상태 정보**\n"
         status_msg += f"• 봇 이름: {bot.user.name}\n"
@@ -356,29 +505,18 @@ async def bot_status(ctx):
         status_msg += f"• 모니터링 중인 버스: {', '.join(sorted(list(monitored_bus_ids))) if monitored_bus_ids else '없음'}\n"
         if last_update_time:
             status_msg += f"• 마지막 업데이트: {last_update_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        else:
-            status_msg += f"• 마지막 업데이트: 없음\n"
-        
-        # 스케줄러 잡 상태 정보 추가
-        job = scheduler.get_job('main_bus_monitor_job')
-        if job:
-            status_msg += f"• 모니터링 스케줄: 평일 (월~금) 오전 9시 ~ 다음날 새벽 2시\n"
-            status_msg += f"• 다음 실행 예정: {job.next_run_time.strftime('%Y-%m-%d %H:%M:%S')} (KST)\n"
-        else:
-            status_msg += f"• 모니터링 스케줄: 설정되지 않음 (봇 시작 시 자동 설정)\n"
+        status_msg += f"• 메인 모니터링 잡 활성화: {'예' if scheduler.get_job('main_bus_monitor_job') else '아니오'}\n"
         
         await ctx.send(status_msg)
 
-# --- 봇 실행 ---
+@bot.command(name='help', help='사용 가능한 모든 명령어를 표시합니다.')
+async def show_help(ctx):
+    help_text = "📚 **사용 가능한 명령어:**\n"
+    for command in bot.commands:
+        if not command.hidden: # 숨겨진 명령어는 제외
+            help_text += f"• `!{command.name}`: {command.help}\n"
+    await ctx.send(help_text)
+
+# 봇 실행
 if __name__ == '__main__':
-    if not DISCORD_BOT_TOKEN:
-        logging.error("DISCORD_BOT_TOKEN 환경 변수가 설정되지 않았습니다. 봇을 실행할 수 없습니다.")
-    elif DISCORD_CHANNEL_ID is None:
-        logging.error("DISCORD_CHANNEL_ID 환경 변수가 설정되지 않았습니다. 봇을 실행할 수 없습니다.")
-    else:
-        try:
-            bot.run(DISCORD_BOT_TOKEN)
-        except discord.errors.LoginFailure as e:
-            logging.error(f"Discord 봇 토큰이 유효하지 않습니다: {e}")
-        except Exception as e:
-            logging.error(f"봇 실행 중 예상치 못한 오류 발생: {e}", exc_info=True)
+    bot.run(DISCORD_BOT_TOKEN)
