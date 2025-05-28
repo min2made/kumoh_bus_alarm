@@ -1,5 +1,0 @@
-discord.py
-selenium
-APScheduler
-beautifulsoup4
-gunicorn
